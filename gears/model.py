@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Sequential, Linear, ReLU
 
-from torch_geometric.nn import SGConv
+from torch_geometric.nn import SGConv, TransformerConv
 
 class MLP(torch.nn.Module):
 
@@ -29,13 +29,45 @@ class MLP(torch.nn.Module):
         self.activation = last_layer_act
         self.network = torch.nn.Sequential(*layers)
         self.relu = torch.nn.ReLU()
+    
     def forward(self, x):
         return self.network(x)
 
 
+class GraphTransformer(nn.Module):
+    """
+    Graph Transformer module that combines graph structure with self-attention
+    """
+    def __init__(self, hidden_size, num_heads=4, dropout=0.1):
+        super(GraphTransformer, self).__init__()
+        self.transformer_layers = nn.ModuleList([
+            TransformerConv(
+                in_channels=hidden_size,
+                out_channels=hidden_size // num_heads,
+                heads=num_heads,
+                dropout=dropout,
+                edge_dim=1  # For edge weights
+            )
+        ])
+        
+        # Layer normalization and residual connection
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, edge_index, edge_weight=None):
+        residual = x
+        
+        for layer in self.transformer_layers:
+            x = layer(x, edge_index, edge_attr=edge_weight.unsqueeze(1) if edge_weight is not None else None)
+            
+        # Apply residual connection and layer normalization
+        x = self.layer_norm(residual + self.dropout(x))
+        return x
+
+
 class GEARS_Model(torch.nn.Module):
     """
-    GEARS model
+    GEARS model with Graph Transformer
 
     """
 
@@ -86,6 +118,30 @@ class GEARS_Model(torch.nn.Module):
         self.sim_layers = torch.nn.ModuleList()
         for i in range(1, self.num_layers + 1):
             self.sim_layers.append(SGConv(hidden_size, hidden_size, 1))
+
+
+        # NEW: Graph Transformer layers for enhanced attention between genes
+        self.use_transformer = args.get('use_transformer', True)
+        self.num_transformer_layers = args.get('num_transformer_layers', 2)
+        self.transformer_heads = args.get('transformer_heads', 4)
+        self.transformer_dropout = args.get('transformer_dropout', 0.1)
+        
+        if self.use_transformer:
+            self.coexpress_transformer = nn.ModuleList([
+                GraphTransformer(
+                    hidden_size=hidden_size,
+                    num_heads=self.transformer_heads,
+                    dropout=self.transformer_dropout
+                ) for _ in range(self.num_transformer_layers)
+            ])
+            
+            self.go_transformer = nn.ModuleList([
+                GraphTransformer(
+                    hidden_size=hidden_size,
+                    num_heads=self.transformer_heads,
+                    dropout=self.transformer_dropout
+                ) for _ in range(self.num_transformer_layers)
+            ])
         
         # decoder shared MLP
         self.recovery_w = MLP([hidden_size, hidden_size*2, hidden_size], last_layer_act='linear')
@@ -135,16 +191,22 @@ class GEARS_Model(torch.nn.Module):
             base_emb = self.emb_trans(emb)        
 
             pos_emb = self.emb_pos(torch.LongTensor(list(range(self.num_genes))).repeat(num_graphs, ).to(self.args['device']))
+            
+            # Apply SGConv layers for positional embedding
             for idx, layer in enumerate(self.layers_emb_pos):
                 pos_emb = layer(pos_emb, self.G_coexpress, self.G_coexpress_weight)
                 if idx < len(self.layers_emb_pos) - 1:
                     pos_emb = pos_emb.relu()
+            
+            # NEW: Apply Graph Transformer layers for enhanced attention on co-expression network
+            if self.use_transformer:
+                for transformer_layer in self.coexpress_transformer:
+                    pos_emb = transformer_layer(pos_emb, self.G_coexpress, self.G_coexpress_weight)
 
             base_emb = base_emb + 0.2 * pos_emb
             base_emb = self.emb_trans_v2(base_emb)
 
             ## get perturbation index and embeddings
-
             pert_index = []
             for idx, i in enumerate(pert_idx):
                 for j in i:
@@ -159,6 +221,11 @@ class GEARS_Model(torch.nn.Module):
                 pert_global_emb = layer(pert_global_emb, self.G_sim, self.G_sim_weight)
                 if idx < self.num_layers - 1:
                     pert_global_emb = pert_global_emb.relu()
+            
+            # NEW: Apply Graph Transformer layers for enhanced attention on gene ontology network
+            if self.use_transformer:
+                for transformer_layer in self.go_transformer:
+                    pert_global_emb = transformer_layer(pert_global_emb, self.G_sim, self.G_sim_weight)
 
             ## add global perturbation embedding to each gene in each cell in the batch
             base_emb = base_emb.reshape(num_graphs, self.num_genes, -1)
@@ -213,4 +280,3 @@ class GEARS_Model(torch.nn.Module):
                 return torch.stack(out), torch.stack(out_logvar)
             
             return torch.stack(out)
-        
