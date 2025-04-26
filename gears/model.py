@@ -121,7 +121,7 @@ class GEARS_Model(torch.nn.Module):
 
 
         # NEW: Graph Transformer layers for enhanced attention between genes
-        self.use_transformer = args.get('use_transformer', True)
+        self.use_transformer = args.get('use_transformer', False)
         self.num_transformer_layers = args.get('num_transformer_layers', 2)
         self.transformer_heads = args.get('transformer_heads', 4)
         self.transformer_dropout = args.get('transformer_dropout', 0.1)

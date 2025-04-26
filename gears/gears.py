@@ -1,11 +1,16 @@
 from copy import deepcopy
 import os
 import pickle
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn as nn
 from torch.optim.lr_scheduler import StepLR
+import torch.nn.functional as F
+import pandas as pd
+
+
 
 from .model import GEARS_Model
 from .inference import evaluate, compute_metrics, deeper_analysis, \
@@ -119,6 +124,56 @@ class GEARS:
                 'direction_lambda': 'regularization term to balance direction loss and prediction loss, default 1'
                }
     
+    # -------contra loss pretraining -----
+    def _calculate_perturbation_deltas(self, single_pert_list):
+        """Calculates mean delta expression for single gene perturbations."""
+        print_sys("Calculating mean delta expression for single perturbations...")
+        delta_vectors = {}
+        control_mean = self.ctrl_expression.cpu().numpy() # Mean control expression
+
+        pert_adata = self.adata[self.adata.obs['condition'].isin(single_pert_list)]
+
+        for pert in tqdm(single_pert_list, desc="Calculating Deltas"):
+            pert_mean = np.mean(pert_adata[pert_adata.obs['condition'] == pert].X.toarray(), axis=0)
+            delta_vectors[pert] = pert_mean - control_mean
+
+        print_sys("Finished calculating deltas.")
+        return delta_vectors
+
+    def _calculate_similarity_matrix(self, delta_vectors_dict, pert_names):
+        """Calculates pairwise similarity (Pearson correlation) between delta vectors."""
+        print_sys("Calculating similarity matrix...")
+        # Ensure order matches pert_names
+        delta_matrix = np.array([delta_vectors_dict[p] for p in pert_names])
+        # Handle potential NaN variance issues if a delta vector is constant zero
+        valid_variance = np.std(delta_matrix, axis=1) > 1e-6
+        if not np.all(valid_variance):
+            print_sys(f"Warning: {np.sum(~valid_variance)} perturbations have near-zero variance in delta expression. Excluding them from similarity calculation.")
+            pert_names = [p for i, p in enumerate(pert_names) if valid_variance[i]]
+            delta_matrix = delta_matrix[valid_variance,:]
+            if len(pert_names) < 2:
+                 print_sys("Not enough valid perturbations to calculate similarity. Skipping pre-training.")
+                 return None, None
+
+
+        # Calculate Pearson correlation matrix
+        # Using np_pearson_cor from utils if available, otherwise np.corrcoef
+        try:
+            from .utils import np_pearson_cor # Try importing the specific function
+            sim_matrix = np_pearson_cor(delta_matrix.T, delta_matrix.T) # gene x pert -> sim between perts
+        except ImportError:
+            print_sys("np_pearson_cor not found in utils, using np.corrcoef.")
+            sim_matrix = np.corrcoef(delta_matrix) # pert x pert -> sim between perts
+
+        # Ensure it's symmetric and NaNs are handled (e.g., set to 0)
+        sim_matrix = np.nan_to_num(sim_matrix)
+        sim_df = pd.DataFrame(sim_matrix, index=pert_names, columns=pert_names)
+        print_sys("Finished calculating similarity matrix.")
+        return sim_df, pert_names # Return potentially filtered pert_names
+    # -------contra loss pretraining -----
+
+
+
     def model_initialize(self, hidden_size = 64,
                          num_go_gnn_layers = 1, 
                          num_gene_gnn_layers = 1,
@@ -236,7 +291,204 @@ class GEARS:
             
         self.model = GEARS_Model(self.config).to(self.device)
         self.best_model = deepcopy(self.model)
+    
+
+    # ------- contrastive  pretraining --------
+    def pretrain_embeddings(self, pretrain_epochs=10, pretrain_lr=1e-3, temperature=0.1, num_negatives=64, positive_threshold=0.5):
+        """
+        Pre-trains the gene embeddings using contrastive loss based on
+        perturbation effect similarity.
+        """
+        print_sys("Starting contrastive pre-training of gene embeddings...")
+        if not hasattr(self, 'model'):
+            raise RuntimeError("Model not initialized. Call model_initialize first.")
+        if not self.pert_list:
+             print_sys("Perturbation list is empty. Skipping pre-training.")
+             return
+
+        # --- 1. Data Preparation ---
+        # Identify single gene perturbations present in the data
+        all_single_perts_in_data = self.adata.obs[self.adata.obs['condition'].str.contains('ctrl', regex=False) & (self.adata.obs['condition'] != 'ctrl')]['condition'].unique()
+        print(f"(Count: {len(all_single_perts_in_data)})")
+
+        # Filter these to only include those also in self.pert_list (the ones with GO graph nodes/embeddings)
+        single_pert_names = all_single_perts_in_data  # [p for p in all_single_perts_in_data if p in self.pert_list]
+
+        if len(single_pert_names) < 2:
+            print_sys(f"Found only {len(single_pert_names)} single gene perturbations in both data and pert_list. Need at least 2 for contrastive learning. Skipping pre-training.")
+            return
+
+        delta_vectors = self._calculate_perturbation_deltas(single_pert_names)
+        sim_df, valid_pert_names = self._calculate_similarity_matrix(delta_vectors, single_pert_names)
+
+        if sim_df is None or len(valid_pert_names) < 2 :
+            print_sys("Could not calculate similarity matrix or not enough valid perturbations. Skipping pre-training.")
+            return
+
+        # Map valid perturbation gene names to their indices in the main gene embedding layer
+        # gene_dict = {g:i for i,g in enumerate(self.gene_list)} # Already calculated in __init__? Check.
+        # Assuming self.pert2gene map is correct from __init__
+
+        # --- NEW STEP: Ensure we have pure gene names from valid_pert_names ---
+        pure_valid_gene_names = set() # Use a set for efficiency
+        starts_with_ctrl_count = 0
+        ends_with_ctrl_count = 0
+        other_format_count = 0 # To count names that don't fit the expected +ctrl format
         
+        condition_to_gene_map = {}
+        gene_to_condition_map = {}
+
+
+        for name_with_ctrl in valid_pert_names:
+            if name_with_ctrl.startswith('ctrl+'):
+                starts_with_ctrl_count += 1
+                parts = name_with_ctrl.split('+')
+                gene_name = parts[1]
+                #  print_sys(gene_name)
+                pure_valid_gene_names.add(gene_name)
+            elif name_with_ctrl.endswith('+ctrl'):
+                ends_with_ctrl_count += 1
+                parts = name_with_ctrl.split('+')
+                gene_name = parts[0]
+                #  print_sys(gene_name)
+                pure_valid_gene_names.add(gene_name)
+            else:
+                # Handle unexpected formats if they occur
+                other_format_count += 1
+                pure_valid_gene_names.add(name_with_ctrl)
+
+        # Print the summary counts
+        print_sys(f"Processed {len(valid_pert_names)} items from valid_pert_names:")
+        print_sys(f"  - Started with 'ctrl+': {starts_with_ctrl_count}")
+        print_sys(f"  - Ended with '+ctrl': {ends_with_ctrl_count}")
+        if other_format_count > 0:
+            print_sys(f"  - Other format (added as-is): {other_format_count}")
+
+        print_sys(f"Extracted {len(pure_valid_gene_names)} unique pure gene names.")
+        # --- End NEW STEP ---
+        
+        # pert2gene is a dictionary of the index of pert and the index of gene
+        pert_indices_in_gene_emb = {name: self.pert2gene[pert_idx]
+                                    for pert_idx, name in enumerate(self.pert_list)
+                                    if name in pure_valid_gene_names and name in self.gene_list} # Check name exists as a gene
+
+        if len(pert_indices_in_gene_emb) < 2:
+             print_sys("Not enough valid perturbations map to gene embeddings. Skipping pre-training.")
+             return
+
+        anchor_pert_names = list(pert_indices_in_gene_emb.keys())
+        print_sys(f"Pre-training embeddings for {len(anchor_pert_names)} genes based on perturbation similarity.")
+
+        # --- 2. Setup Optimizer ---
+        optimizer = optim.Adam(self.model.gene_emb.parameters(), lr=pretrain_lr)
+        embedding_layer = self.model.gene_emb
+
+        # --- 3. Pre-training Loop ---
+        self.model.train() # Keep model in train mode for embeddings update
+
+        for epoch in range(pretrain_epochs):
+            total_loss = 0
+            processed_anchors = 0
+            np.random.shuffle(anchor_pert_names) # Shuffle anchors each epoch
+
+            for anchor_name in anchor_pert_names:
+                # --- Anchor ---
+                anchor_idx = torch.tensor([pert_indices_in_gene_emb[anchor_name]], dtype=torch.long).to(self.device)
+                anchor_emb = embedding_layer(anchor_idx)
+
+                # --- Positive Selection ---
+                # Find perturbations similar to the anchor
+                possible_key1 = anchor_name + '+ctrl'
+                possible_key2 = 'ctrl+' + anchor_name
+                original_anchor_condition = None
+
+                if possible_key1 in sim_df.index:
+                    original_anchor_condition = possible_key1
+                elif possible_key2 in sim_df.index:
+                    original_anchor_condition = possible_key2
+                else:
+                    print_sys(f"Warning: Neither '{possible_key1}' nor '{possible_key2}' found in sim_df index for anchor '{anchor_name}'. Skipping.")
+                    continue
+
+                # Access similarities using the found original condition name
+                similarities = sim_df.loc[original_anchor_condition].drop(original_anchor_condition) # Exclude self
+               
+                pos_candidates = similarities[similarities > positive_threshold].index.tolist()
+                # print_sys(pos_candidates)
+                # Filter candidates to those that have embeddings
+                # pos_candidates = [p for p in pos_candidates if p in pert_indices_in_gene_emb]
+                # print_sys(pos_candidates)
+
+                if not pos_candidates:
+                    print_sys('# Skip if no suitable positive found')
+                    continue # Skip if no suitable positive found
+
+                # Choose one positive sample (e.g., randomly from candidates or the most similar)
+                # positive_name = np.random.choice(pos_candidates)
+                positive_name = similarities[pos_candidates].idxmax() # Take the most similar
+                parts = positive_name.split('+')
+                positive_name = parts[0] if parts[1] == 'ctrl' else parts[1]
+
+                positive_idx = torch.tensor([pert_indices_in_gene_emb[positive_name]], dtype=torch.long).to(self.device)
+                positive_emb = embedding_layer(positive_idx)
+
+                # --- Negative Selection ---
+                # Sample perturbations that are not the anchor or the positive
+                possible_negatives = [name for name in anchor_pert_names if name != anchor_name and name != positive_name]
+                if not possible_negatives:
+                    print_sys('# Skip if no negative found')
+                    continue # Skip if no negatives possible
+
+                num_actual_negatives = min(num_negatives, len(possible_negatives))
+                sampled_negative_names = np.random.choice(possible_negatives, num_actual_negatives, replace=False)
+
+                negative_indices = torch.tensor([pert_indices_in_gene_emb[name] for name in sampled_negative_names], dtype=torch.long).to(self.device)
+                negative_embs = embedding_layer(negative_indices) # [num_negatives, hidden_size]
+
+                # --- Compute InfoNCE Loss ---
+                # Cosine similarity: requires N x D and N x D (or 1 x D and N x D)
+                sim_pos = F.cosine_similarity(anchor_emb, positive_emb, dim=1) # [1]
+                sim_neg = F.cosine_similarity(anchor_emb.repeat(num_actual_negatives, 1), negative_embs, dim=1) # [num_negatives]
+
+                logits_pos = sim_pos / temperature
+                logits_neg = sim_neg / temperature
+
+                # Combine positive and negative logits for denominator
+                # Positive is the first element
+                all_logits = torch.cat([logits_pos, logits_neg]) # [1 + num_negatives]
+
+                # Calculate log-softmax. Target is index 0 (the positive sample)
+                log_probs = F.log_softmax(all_logits, dim=0)
+
+                # Loss is the negative log-probability of the positive sample
+                loss = -log_probs[0]
+
+                # --- Optimization Step ---
+                if torch.isnan(loss): # Check for NaN loss
+                     print_sys(f"Warning: NaN loss encountered for anchor {anchor_name}. Skipping update.")
+                     continue
+
+                optimizer.zero_grad()
+                loss.backward()
+                # Optional: Gradient clipping if needed
+                # torch.nn.utils.clip_grad_norm_(embedding_layer.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_loss += loss.item()
+                processed_anchors += 1
+
+            if processed_anchors > 0:
+                avg_loss = total_loss / processed_anchors
+                print_sys(f"Pre-train Epoch {epoch+1}/{pretrain_epochs}, Avg Loss: {avg_loss:.4f}")
+            else:
+                print_sys(f"Pre-train Epoch {epoch+1}/{pretrain_epochs}, No anchors processed.")
+
+
+        print_sys("Finished contrastive pre-training.")
+        # Set model back to eval mode potentially, or let the main training loop handle it.
+        # self.model.eval()
+    # ------- contrastive  pretraining --------
+
     def load_pretrained(self, path):
         """
         Load pretrained model

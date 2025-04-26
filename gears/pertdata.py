@@ -165,7 +165,7 @@ class PertData:
                 url = 'https://dataverse.harvard.edu/api/access/datafile/7458694'
             data_path = os.path.join(self.data_path, data_name)
             zip_data_download_wrapper(url, data_path, self.data_path)
-            self.dataset_name = data_path.split('/')[-1]
+            self.dataset_name = os.path.basename(data_path)
             self.dataset_path = data_path
             adata_path = os.path.join(data_path, 'perturb_processed.h5ad')
             self.adata = sc.read_h5ad(adata_path)
@@ -173,7 +173,7 @@ class PertData:
         elif os.path.exists(data_path):
             adata_path = os.path.join(data_path, 'perturb_processed.h5ad')
             self.adata = sc.read_h5ad(adata_path)
-            self.dataset_name = data_path.split('/')[-1]
+            self.dataset_name = os.path.basename(data_path)
             self.dataset_path = data_path
         else:
             raise ValueError("data attribute is either norman, adamson, dixit "
@@ -187,6 +187,7 @@ class PertData:
                                   self.adata.obs.condition.apply(
                                   lambda x:not filter_pert_in_go(x,
                                         self.pert_names))].condition.unique())
+        print_sys(len(not_in_go_pert))
         print_sys(not_in_go_pert)
         
         filter_go = self.adata.obs[self.adata.obs.condition.apply(
